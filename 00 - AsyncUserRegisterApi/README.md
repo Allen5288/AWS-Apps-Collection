@@ -9,7 +9,7 @@ And remove all console log~~！ But currently, for the test version
 
 ## 🎯 What This API Does
 
-- **Register users** → Process asynchronously via SNS → Store in DynamoDB  
+- **Register users** → Process asynchronously via SNS → Store in DynamoDB
 - **Create message boards** → Process asynchronously via SQS → Store in DynamoDB
 - **Post messages** → Process asynchronously via SNS → Store in DynamoDB + WebSocket notifications
 - **Real-time messages** → WebSocket subscriptions for live updates
@@ -19,7 +19,7 @@ And remove all console log~~！ But currently, for the test version
 All endpoints are prefixed with `/api/v1`
 
 - `POST /api/v1/register` - Register user (returns 202, processes async)
-- `GET /api/v1/user/{email}` - Get user details  
+- `GET /api/v1/user/{email}` - Get user details
 - `GET /api/v1/boards` - List all message boards
 - `POST /api/v1/boards` - Create board (returns 202, processes async)
 - `POST /api/v1/boards/{id}/messages` - Post message (returns 202, processes async)
@@ -41,7 +41,7 @@ All endpoints are prefixed with `/api/v1`
 aws configure
 # Enter your:
 # - AWS Access Key ID
-# - AWS Secret Access Key  
+# - AWS Secret Access Key
 # - Default region (us-east-1)
 # - Output format (json)
 ```
@@ -92,7 +92,7 @@ curl "YOUR_API_URL/api/v1/boards"
 
 - **Async Processing**: All create operations return immediately (202 status)
 - **SNS**: User registration & message posting
-- **SQS**: Board creation  
+- **SQS**: Board creation
 - **DynamoDB**: Data storage with proper indexing
 - **WebSocket**: Real-time message notifications
 - **TypeScript**: Full type safety
@@ -125,3 +125,64 @@ npm run remove
 ```
 
 This removes all AWS resources to avoid charges.
+
+## 🧾 2026-11-21 — Making async registration safe: idempotency keys and the dead-letter queue
+
+`POST /api/v1/register` returns 202 and processes the registration
+asynchronously through SNS → Lambda → DynamoDB. That shape is fast,
+but SNS and SQS deliver *at least once*: a retry, a timeout, or a
+double-click can deliver the same registration twice. Without a guard,
+the same user is written twice — or two welcome emails go out. Today
+the API gets the two guards that make at-least-once delivery safe.
+
+### 1. Idempotency key: one key, one write
+
+- The client sends an `Idempotency-Key` header (a UUID it generates
+  once per registration attempt) and retries with the *same* key.
+- The processing Lambda writes to DynamoDB with a condition
+  expression: `attribute_not_exists(idempotency_key)`. The first
+  delivery wins; a duplicate delivery sees the key already exists
+  and returns the stored result instead of writing again.
+- Store the key with the user record (or in a small idempotency
+  table with a TTL of 24 hours) so a retry hours later is still
+  recognised. Without a TTL the table grows forever; 24 hours covers
+  any realistic retry window for a registration.
+- The API layer also returns the same 202 and the same
+  `registration_id` for a repeated key, so the client cannot tell —
+  and does not need to tell — whether this was the first attempt.
+
+### 2. Dead-letter queue: let failures fail loudly, once
+
+- The SQS queue behind board creation gets a DLQ with
+  `maxReceiveCount` of 3: a message that fails processing three
+  times moves to the DLQ instead of being retried forever.
+- Set the queue's visibility timeout to at least 6× the Lambda
+  timeout. If the Lambda times out at 30 s, a visibility timeout
+  shorter than that makes the message visible again while the first
+  attempt is still running — the same message is then processed
+  twice at once.
+- Alarm on the DLQ (any message in it) and redrive manually after
+  fixing the cause. A DLQ you never look at is just a bin; a DLQ
+  with an alarm is the difference between "one user failed to
+  register" and "registrations have been silently failing all week".
+- SNS fan-out for registration has no DLQ of its own — subscribe an
+  SQS queue to the topic first, then let the Lambda read from that
+  queue, so the same redrive pattern applies.
+
+### Checklist before the next deploy
+
+- [ ] `Idempotency-Key` accepted on `POST /api/v1/register` and
+      stored with a 24-hour TTL
+- [ ] Conditional write (`attribute_not_exists`) in the processing
+      Lambda; duplicate delivery returns the stored result
+- [ ] DLQ on the board-creation SQS queue, `maxReceiveCount` 3
+- [ ] Visibility timeout ≥ 6× Lambda timeout
+- [ ] CloudWatch alarm on DLQ depth > 0
+
+### What I will add next in this file
+
+- 2026-11-22: request validation and error responses (Zod-style
+  schemas, one error shape for the whole API) — see the
+  "Further implementation things" list at the top.
+- Later: Cognito + JWT auth, and CloudWatch dashboards for the async
+  pipeline.
