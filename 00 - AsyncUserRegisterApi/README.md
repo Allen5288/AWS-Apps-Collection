@@ -181,8 +181,86 @@ the API gets the two guards that make at-least-once delivery safe.
 
 ### What I will add next in this file
 
-- 2026-11-22: request validation and error responses (Zod-style
-  schemas, one error shape for the whole API) — see the
-  "Further implementation things" list at the top.
-- Later: Cognito + JWT auth, and CloudWatch dashboards for the async
-  pipeline.
+- 2026-11-24: Cognito + JWT auth — who can register, and what a
+  token proves at the API boundary.
+- Later: CloudWatch dashboards for the async pipeline — queue
+  depth, DLQ alarms, and end-to-end latency.
+
+## 🧾 2026-11-23 — Request validation and error responses: one error shape for the whole API
+
+Yesterday's idempotency and DLQ guards make the async pipeline
+safe. Today the API boundary gets the same treatment: validate
+every request before it touches SNS or SQS, and answer every
+failure in one predictable shape, so clients never have to guess
+what went wrong.
+
+### One error shape, everywhere
+
+```json
+{
+  "code": "VALIDATION_ERROR",
+  "message": "email is not a valid email address",
+  "correlationId": "9f2c4a1e-…",
+  "details": [
+    { "field": "email", "issue": "must be a valid email address" }
+  ]
+}
+```
+
+- `code` is a stable machine-readable string — clients switch on
+  it, never on the message text.
+- `message` is one human-readable sentence.
+- `correlationId` is generated per request and logged with every
+  downstream step, so a 400 at the edge can be traced through the
+  SNS topic, the processing Lambda, and DynamoDB.
+- `details` is present only for validation errors, one entry per
+  bad field. Never include a stack trace, an SQL fragment, or an
+  AWS error — internals stay in the server log (see the NodeJS
+  error-handling notes, 2026-11-21).
+
+### HTTP codes, by failure
+
+| Situation | Code | `code` value |
+|---|---|---|
+| A field fails validation | 400 | `VALIDATION_ERROR` |
+| Missing or invalid auth (once Cognito lands) | 401 | `UNAUTHORISED` |
+| Valid request, not allowed | 403 | `FORBIDDEN` |
+| Unknown user / board / message id | 404 | `NOT_FOUND` |
+| Same idempotency key, different body | 409 | `IDEMPOTENCY_CONFLICT` |
+| Anything unexpected server-side | 500 | `INTERNAL_ERROR`, generic message only |
+
+### Validate at the boundary, with a schema
+
+Validate in the API Lambda before publishing to SNS/SQS — a bad
+request rejected in 10 ms costs nothing; a bad message that
+travels the whole pipeline and dies in the processing Lambda
+costs a DLQ entry and a redrive. In TypeScript, a Zod-style schema
+keeps the rule next to the type:
+
+```typescript
+import { z } from "zod";
+
+const RegisterUserSchema = z.object({
+  name: z.string().trim().min(1).max(100),
+  email: z.string().email().max(254),
+});
+
+const result = RegisterUserSchema.safeParse(body);
+if (!result.success) {
+  return errorResponse(400, "VALIDATION_ERROR", result.error.issues);
+}
+```
+
+Rules that follow from this: trim strings before validating;
+reject unknown fields rather than silently dropping them (a client
+sending `emai` instead of `email` should get a 400, not a user
+with no email); cap string lengths — DynamoDB and SNS both have
+size limits, and an unbounded string is a cheap denial of service.
+
+### Correlation ids through the async pipeline
+
+The API generates the correlation id and passes it as an SNS/SQS
+message attribute, not inside the payload. The processing Lambda
+logs it with every step, and the 202 response returns it, so a
+client that reports "my registration never arrived" gives support
+one id to search in CloudWatch instead of a timestamp and a guess.
