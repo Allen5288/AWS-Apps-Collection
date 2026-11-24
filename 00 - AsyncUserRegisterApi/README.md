@@ -181,9 +181,8 @@ the API gets the two guards that make at-least-once delivery safe.
 
 ### What I will add next in this file
 
-- 2026-11-24: Cognito + JWT auth — who can register, and what a
-  token proves at the API boundary.
-- Later: CloudWatch dashboards for the async pipeline — queue
+- 2026-11-25: Cognito + JWT auth — done, see the section below.
+- Next: CloudWatch dashboards for the async pipeline — queue
   depth, DLQ alarms, and end-to-end latency.
 
 ## 🧾 2026-11-23 — Request validation and error responses: one error shape for the whole API
@@ -264,3 +263,99 @@ message attribute, not inside the payload. The processing Lambda
 logs it with every step, and the 202 response returns it, so a
 client that reports "my registration never arrived" gives support
 one id to search in CloudWatch instead of a timestamp and a guess.
+
+## 🧾 2026-11-25 — Cognito + JWT auth: who can register, and what a token proves
+
+Until now the API is open: anyone can register a user, create a
+board or post a message. That is fine for a demo and wrong for
+anything real. Today it gets identity: Amazon Cognito User Pool
+for sign-up and sign-in, and JWT access tokens checked at the API
+boundary.
+
+### User Pool vs Identity Pool — pick the right one
+
+- **User Pool** is a user directory: sign-up, sign-in, password
+  reset, groups, and JWTs (id token, access token, refresh token).
+  This is what the API needs.
+- **Identity Pool** exchanges a token for temporary AWS
+  credentials, so a client can call AWS services directly (upload
+  to S3, for example). The API does not need it — clients talk to
+  API Gateway, not to AWS directly. Adding it now would hand out
+  AWS credentials for no reason.
+
+### The flow
+
+1. Client signs up (via the Cognito SDK or hosted UI), confirms
+   email, signs in.
+2. Cognito returns an **id token** (who the user is), an **access
+   token** (what the client may do, 1 hour), and a **refresh token**
+   (30 days, used to get new access tokens).
+3. The client sends `Authorization: Bearer <access_token>` on
+   every API call.
+4. API Gateway's **JWT authorizer** verifies the token before the
+   Lambda ever runs: signature against the pool's JWKS, `iss`
+   matches the pool, `aud`/`client_id` matches the app client,
+   `exp` not passed, `token_use` is `access`.
+5. The Lambda receives the claims — `sub` (stable user id),
+   `email`, `cognito:groups` — and uses them for authorisation.
+
+### What a token proves — and what it does not
+
+A valid access token proves the bearer authenticated as that user
+at that time. It does **not** prove they may do this action.
+Authorisation is still the API's job:
+
+- Only the board creator may edit the board: check `sub` against
+  the board's `createdBy`, in the Lambda, not in the frontend.
+- Admin actions check `cognito:groups` contains `admin`. Groups
+  are a claim in the token, so the check is one string comparison
+  — but it must happen server-side, where the client cannot fake it.
+
+### Verify properly, or do not verify at all
+
+- Fetch the JWKS from
+  `https://cognito-idp.{region}.amazonaws.com/{userPoolId}/.well-known/jwks.json`,
+  cache the keys, and verify the RS256 signature. A token accepted
+  without signature verification is just a JSON blob the client
+  wrote itself.
+- Check `iss`, `aud`, `exp` and `token_use` every time. The JWT
+  authorizer does all of this — prefer it over hand-rolled
+  verification in the Lambda.
+- Short-lived access tokens (1 hour) plus refresh-token rotation:
+  a stolen access token is useful for an hour at most, and a
+  revoked refresh token stops working. Use revocation for logout
+  and for banning a user.
+- Do not store tokens in `localStorage` for a browser client —
+  any script on the page can read them. Use an `httpOnly` cookie
+  or keep them in memory.
+
+### What changes in this API
+
+| Endpoint | Before | After |
+|---|---|---|
+| `POST /api/v1/register` | Open | Stays open — registering *is* the point |
+| `POST /api/v1/boards` | Open | Requires access token |
+| `POST /api/v1/boards/{id}/messages` | Open | Requires access token |
+| `GET /api/v1/boards`, `GET /.../messages` | Open | Stay open (public boards); per-board privacy comes later |
+| `GET /api/v1/user/{email}` | Open | Requires token, and `sub` must own the record |
+
+The 401/403 rows from the error table (2026-11-23) now have a
+real meaning: 401 is "no valid token", 403 is "valid token, not
+your board". The correlation id from that section still travels
+with the request, so a rejected call is traceable end to end.
+
+### Checklist before the next deploy
+
+- [ ] User Pool + app client created, JWT authorizer on the
+      protected routes
+- [ ] `POST /boards` and `POST /messages` reject requests with no
+      token (401) and with a token for a different user (403)
+- [ ] `sub` checked against resource owner in the Lambda, not the
+      client
+- [ ] Refresh-token rotation on; revocation tested (sign out kills
+      the session)
+
+### What I will add next in this file
+
+- CloudWatch dashboards for the async pipeline — queue depth, DLQ
+  alarms, and end-to-end latency.
