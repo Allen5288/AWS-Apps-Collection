@@ -355,7 +355,148 @@ with the request, so a rejected call is traceable end to end.
 - [ ] Refresh-token rotation on; revocation tested (sign out kills
       the session)
 
+## 🧾 2026-11-26 — CloudWatch dashboards for the async pipeline: see the queue, not just the code
+
+The 21 Nov section added idempotency keys and a DLQ; the 25 Nov
+section added Cognito auth. All of that is invisible in production
+without observability. An async pipeline fails quietly by design —
+a message sits in a queue, a Lambda errors and retries, a user
+never gets their welcome email, and nobody notices until support
+gets the ticket. Today the pipeline gets eyes: one dashboard, four
+alarms, and an end-to-end latency number.
+
+### The four questions the dashboard must answer
+
+1. **Is work flowing?** Messages published to SNS vs messages
+   processed by the Lambda. If published climbs and processed
+   stays flat, the pipeline is stuck.
+2. **Is work stuck?** `ApproximateNumberOfMessagesVisible` on the
+   board-creation SQS queue (queue depth) and
+   `ApproximateAgeOfOldestMessage` (oldest message age). Depth
+   tells you how much is waiting; age tells you how long the
+   unluckiest message has waited. Age is the better alarm — depth
+   can be healthy during a burst, age cannot.
+3. **Is work failing?** Lambda `Errors` and `Throttles` per
+   function, plus DLQ depth (`ApproximateNumberOfMessagesVisible`
+   on the DLQ). Any message in the DLQ is an alarm, not a metric
+   to watch — see the 21 Nov checklist.
+4. **How slow is it, end to end?** From the API returning 202 to
+   the user record becoming `active`. The correlation id from the
+   23 Nov section is the join key: log it with a timestamp at
+   publish time and at process time, and the difference is the
+   latency. Without it you have two unrelated graphs and a guess.
+
+### The dashboard (one `aws cloudwatch put-dashboard` call)
+
+```json
+{
+  "widgets": [
+    {
+      "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
+      "properties": {
+        "title": "Queue depth + oldest message age",
+        "metrics": [
+          ["AWS/SQS", "ApproximateNumberOfMessagesVisible",
+           "QueueName", "board-creation-queue"],
+          [".", "ApproximateAgeOfOldestMessage",
+           ".", "board-creation-queue", { "yAxis": "right" }]
+        ],
+        "view": "timeSeries", "stacked": false, "period": 300
+      }
+    },
+    {
+      "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
+      "properties": {
+        "title": "Lambda errors + throttles",
+        "metrics": [
+          ["AWS/Lambda", "Errors", "FunctionName", "process-registration"],
+          [".", "Throttles", ".", "."],
+          [".", "Errors", ".", "process-board"]
+        ],
+        "view": "timeSeries", "stacked": false, "period": 300
+      }
+    },
+    {
+      "type": "metric", "x": 0, "y": 6, "width": 12, "height": 6,
+      "properties": {
+        "title": "DLQ depth (any message here = alarm)",
+        "metrics": [
+          ["AWS/SQS", "ApproximateNumberOfMessagesVisible",
+           "QueueName", "board-creation-dlq"]
+        ],
+        "view": "timeSeries", "stacked": false, "period": 60
+      }
+    },
+    {
+      "type": "metric", "x": 12, "y": 6, "width": 12, "height": 6,
+      "properties": {
+        "title": "Lambda duration p95 (ms)",
+        "metrics": [
+          ["AWS/Lambda", "Duration", "FunctionName", "process-registration",
+           { "stat": "p95" }]
+        ],
+        "view": "timeSeries", "stacked": false, "period": 300
+      }
+    }
+  ]
+}
+```
+
+Why these four widgets and not more: a dashboard you never open
+is decoration. Four widgets fit on one screen; each answers one
+of the four questions above. Add widgets only when a real incident
+needed a graph you did not have.
+
+### Alarms — the dashboard is for humans, alarms are for the pager
+
+| Alarm | Metric | Threshold | Why this value |
+|---|---|---|---|
+| DLQ not empty | DLQ `ApproximateNumberOfMessagesVisible` | > 0 for 1 min | Any DLQ message is a failed registration; see 21 Nov |
+| Oldest message too old | Queue `ApproximateAgeOfOldestMessage` | > 300 s for 5 min | A registration should process in seconds, not minutes |
+| Lambda errors | `Errors` summed per function | > 0 for 5 min | Errors in an async worker are invisible without this |
+| Lambda throttles | `Throttles` summed per function | > 0 for 5 min | Throttling means the concurrency limit is hit — a capacity question, not a bug |
+
+```bash
+aws cloudwatch put-metric-alarm \
+  --alarm-name board-creation-dlq-not-empty \
+  --namespace AWS/SQS \
+  --metric-name ApproximateNumberOfMessagesVisible \
+  --dimensions Name=QueueName,Value=board-creation-dlq \
+  --statistic Maximum --period 60 --threshold 0 \
+  --comparison-operator GreaterThanThreshold \
+  --evaluation-periods 1 --alarm-actions <sns-topic-arn>
+```
+
+Send alarms to an SNS topic (email for now; a PagerDuty/Opsgenie
+integration later). An alarm with no notification is the DLQ
+problem again — a bin nobody looks at.
+
+### Cost and limits, honestly
+
+- CloudWatch dashboards cost ~$3/month per dashboard; alarms
+  ~$0.10/month each; metrics are mostly free at this scale (Lambda
+  and SQS emit them by default). Observability for this pipeline is
+  under $5/month — cheaper than one lost registration.
+- `ApproximateNumberOfMessagesVisible` is approximate and sampled
+  per minute; do not build exact-count logic on it. The alarm
+  threshold (> 0) is safe because the DLQ should be empty, not
+  because the number is precise.
+- Log-based latency (correlation id timestamps) needs a log
+  Insights query or a custom metric with an embedded metric format;
+  that is the next step, not this one — the dashboard above works
+  with default metrics only.
+
+### Checklist before the next deploy
+
+- [ ] Dashboard created from the JSON above (one screen, four widgets)
+- [ ] All four alarms created, wired to the SNS topic, and tested
+      (send one bad message to the DLQ on purpose, watch the alarm fire)
+- [ ] Correlation id logged at publish and at process time
+- [ ] Alarm test recorded: date, which alarm, time to notify
+
 ### What I will add next in this file
 
-- CloudWatch dashboards for the async pipeline — queue depth, DLQ
-  alarms, and end-to-end latency.
+- End-to-end latency as a real number: log-based metric from the
+  correlation-id timestamps, and a p95 latency alarm.
+- API Gateway throttling + usage plans, so one abusive client
+  cannot fill the queue faster than the workers drain it.
