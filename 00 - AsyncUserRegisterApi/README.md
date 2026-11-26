@@ -494,9 +494,142 @@ problem again — a bin nobody looks at.
 - [ ] Correlation id logged at publish and at process time
 - [ ] Alarm test recorded: date, which alarm, time to notify
 
+
+## 🧾 2026-11-27 — End-to-end latency as a real number: log-based metric + p95 alarm
+
+The 26 Nov dashboard shows queue depth, Lambda errors and Lambda
+duration — but not the number a user actually feels: from the API
+returning 202 to the user record becoming `active`. Duration tells
+you the worker was slow; it does not tell you the registration was
+slow. The queue wait in between is invisible. Today that latency
+becomes a real metric, built from the correlation id that has been
+travelling with every request since 23 Nov.
+
+### The raw material: two timestamps, one correlation id
+
+The API Lambda already logs the correlation id at publish time; the
+processing Lambda logs it at process time. Add the timestamp to
+both, in the same shape:
+
+```text
+[9f2c4a1e-…] PUBLISHED service=register latency_stage=publish
+[9f2c4a1e-…] PROCESSED service=register latency_stage=process
+```
+
+CloudWatch Logs Insights joins them:
+
+```sql
+fields @timestamp, correlationId, latency_stage
+| filter service = "register"
+| stats min(@timestamp) as first, max(@timestamp) as last
+    by correlationId
+| stats avg(last - first) as avg_ms, pct(last - first, 95) as p95_ms
+```
+
+That query is the answer, but it is a query — it only runs when
+someone runs it. For an alarm, the latency has to be a metric. That
+is what Embedded Metric Format (EMF) is for: log a JSON line and
+CloudWatch turns it into a metric, no `PutMetricData` call, no
+extra SDK, no extra cost beyond the log line itself.
+
+### The processing Lambda emits the metric
+
+At the end of a successful process — where the code already knows
+the publish timestamp, because it arrived as an SQS message
+attribute — log one EMF line:
+
+```json
+{
+  "_aws": {
+    "Timestamp": 1793412000000,
+    "CloudWatchMetrics": [
+      {
+        "Namespace": "AsyncUserRegisterApi",
+        "Dimensions": [["Service"]],
+        "Metrics": [{ "Name": "EndToEndLatencyMs", "Unit": "Milliseconds" }]
+      }
+    ]
+  },
+  "Service": "register",
+  "EndToEndLatencyMs": 2340
+}
+```
+
+Rules for the EMF line, learned the hard way:
+
+- **One metric per line, one line per registration.** EMF is a log
+  format, not a batch API — a line with ten values is ten data
+  points CloudWatch cannot attribute to one registration.
+- **The timestamp is the process time, not the publish time.**
+  The latency *value* is `processed_at - published_at`; the EMF
+  `Timestamp` is when the metric was emitted. Mixing them up shifts
+  every spike by the latency itself.
+- **Dimensions stay small.** `Service=register` only. A dimension
+  per user or per correlation id creates a metric per user — a
+  cardinality explosion that costs real money ($0.30 per metric
+  per month, times thousands of users).
+- **Log the publish timestamp as a message attribute, not in the
+  payload.** The payload is the business data; the attribute is
+  the pipeline metadata. Same rule as the correlation id (23 Nov).
+
+### Reading it: p50, p95, max — and what each one means
+
+| Statistic | What it tells you |
+|---|---|
+| p50 (~2 s here) | The typical registration. If this climbs, the whole pipeline slowed down. |
+| p95 (~8 s here) | The unlucky 5%. This is the number to alarm on — it is what a real user feels on a bad day. |
+| max | One bad message. Useful for the post-incident read, useless as an alarm — one slow registration pages nobody. |
+
+Expected shape for this pipeline: p50 of a couple of seconds
+(SNS → Lambda → DynamoDB is fast when nothing is wrong), p95
+under a minute even with a retry. If p95 is minutes, the queue is
+the bottleneck, not the code — check the oldest-message-age alarm
+from 26 Nov before touching the Lambda.
+
+### The p95 alarm
+
+```bash
+aws cloudwatch put-metric-alarm \
+  --alarm-name register-end-to-end-latency-p95-high \
+  --namespace AsyncUserRegisterApi \
+  --metric-name EndToEndLatencyMs \
+  --dimensions Name=Service,Value=register \
+  --statistic p95 --period 300 --threshold 60000 \
+  --comparison-operator GreaterThanThreshold \
+  --evaluation-periods 1 --treat-missing-data notBreaching \
+  --alarm-actions <sns-topic-arn>
+```
+
+- **Threshold 60 s for 1 period (5 min).** A registration should
+  complete in seconds; a minute at p95 means the pipeline is
+  backed up, not that one message was slow.
+- **`--treat-missing-data notBreaching`.** No registrations means
+  no metric, and no metric is not an incident — it is a quiet
+  hour. The DLQ alarm from 26 Nov is the one that fires when work
+  exists and is not moving; this one fires when work exists and is
+  moving too slowly.
+
+### Cost, honestly
+
+One custom metric ($0.30/month) + one alarm ($0.10/month). The EMF
+log lines cost the same as any other log line — nothing extra. The
+whole observability stack for this pipeline is still under
+$5/month, and it now answers all four questions from 26 Nov plus
+the one that matters most: how slow was it, end to end.
+
+### Checklist before the next deploy
+
+- [ ] Publish timestamp sent as an SQS/SNS message attribute;
+      correlation id logged at publish and at process time
+- [ ] Processing Lambda logs one EMF line per successful
+      registration (`EndToEndLatencyMs`, `Service=register`)
+- [ ] p95 alarm created (60 s, 5 min), wired to the SNS topic,
+      tested with a slow message on purpose
+- [ ] Dashboard's fourth widget (Lambda duration p95) kept — it
+      answers "was the worker slow", this metric answers "was the
+      registration slow"; both are needed to tell them apart
+
 ### What I will add next in this file
 
-- End-to-end latency as a real number: log-based metric from the
-  correlation-id timestamps, and a p95 latency alarm.
 - API Gateway throttling + usage plans, so one abusive client
   cannot fill the queue faster than the workers drain it.
