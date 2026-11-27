@@ -629,7 +629,148 @@ the one that matters most: how slow was it, end to end.
       answers "was the worker slow", this metric answers "was the
       registration slow"; both are needed to tell them apart
 
+## 🧾 2026-11-28 — API Gateway throttling + usage plans: one abusive client cannot fill the queue
+
+The 27 Nov section ended with a warning: one abusive client can
+fill the queue faster than the workers drain it. Idempotency keys,
+the DLQ and the dashboards protect the pipeline once a message is
+inside it; nothing yet protects the front door. Today API Gateway
+gets throttling and usage plans, so a loop, a misconfigured
+client, or a burst of double-clicks hits a limit at the edge
+instead of becoming queue depth, DLQ entries and a Lambda bill.
+
+### The three levels of throttling, and which one wins
+
+API Gateway throttles at three levels. The most specific limit
+applies — a request is throttled if *any* level says so.
+
+| Level | What it limits | Default |
+|---|---|---|
+| Account | All APIs in the region | 10,000 req/s steady, 5,000 burst |
+| Stage | One API, one stage (`prod`) | Inherits the account default |
+| Method | One route, e.g. `POST /register` | Inherits the stage |
+| Usage plan | One API key | No default — you define it |
+
+The default account limits are far above what this API needs —
+10,000 registrations a *month* is about one every four minutes.
+The point of setting limits is not capacity, it is blast radius:
+a client that can only ever send 100 requests a minute cannot
+fill a queue the workers drain at dozens a second.
+
+### Burst vs rate: two numbers, two different failures
+
+Throttling is a token bucket, and the two settings answer
+different questions. **Rate** (requests per second, sustained) is
+the refill: a client sending steadily above the rate is throttled,
+however polite each request is. **Burst** is the bucket size: how
+many requests can arrive at once — a retry storm after an outage,
+a double-click loop. Set them separately: a generous burst (a real
+user retrying sends two or three requests, not one) and a strict
+rate (a sustained flood is never legitimate traffic for a signup
+form). A limit that throttles a real user's retry is a bug; a
+limit that lets a flood through is not a limit.
+
+### Usage plans + API keys: one plan per client tier
+
+A usage plan is the product decision: how much of the API a
+client may use. Three tiers, matching the way the agency will
+actually sell this:
+
+| Tier | Throttle (rate / burst) | Quota | Who it is for |
+|---|---|---|---|
+| Free | 10 req/s, burst 20 | 1,000 requests / day | Trying the API, a demo client |
+| Standard | 100 req/s, burst 200 | 100,000 requests / month | A paying customer, one integration |
+| Premium | 500 req/s, burst 1,000 | 1,000,000 requests / month | A platform partner, many end users |
+
+Each client gets an API key attached to one plan. The plan's
+throttle and quota are enforced per key, so one client's flood
+throttles that client and nobody else — the difference between
+throttling and an outage. Revoking a client is deleting their key:
+no code change, no redeploy. (The Azure side already has this
+shape: APIM product + subscription, 27 Nov.)
+
+### What a throttled client sees: 429, and how to behave
+
+A throttled request gets **429 Too Many Requests** with a
+`Retry-After` header (seconds to wait). The response uses the one
+error shape from 23 Nov, so the client switches on the code:
+
+```json
+{ "code": "RATE_LIMITED",
+  "message": "Too many requests — retry after 5 seconds",
+  "correlationId": "9f2c4a1e-…" }
+```
+
+- **Retry with exponential backoff + jitter, and honour
+  `Retry-After`.** A client that retries immediately, all at once,
+  is the retry storm the limit exists to stop.
+- **Retry with the *same* `Idempotency-Key`.** A throttled
+  registration never reached the pipeline, but the client's retry
+  is indistinguishable from a retry of a request that did. The
+  21 Nov idempotency rule covers both: same key, same result, no
+  duplicate user.
+- **Never retry a 429 as if it were a 500.** A 500 means "try
+  again, the server failed"; a 429 means "slow down, you are the
+  problem". Treating them the same is how a client retries itself
+  into a ban.
+
+### How this composes with the idempotency + DLQ design
+
+Throttling sits *before* the pipeline, and the three guards cover
+three different failures — none substitutes for another:
+
+| Guard | Protects against | Where it lives |
+|---|---|---|
+| Throttling + usage plans | Too much traffic arriving | API Gateway, before the Lambda runs |
+| Idempotency key | The same registration delivered twice | Processing Lambda, DynamoDB conditional write |
+| DLQ | A message that can never be processed | SQS, after `maxReceiveCount` 3 |
+
+A 429 is not a failure to DLQ: the request never entered the
+queue, so there is nothing to redrive. A DLQ message is not a
+throttling problem: it got in and then failed three times. If both
+alarms fire together, the cause is almost certainly a client
+flooding the API *and* a bug in the worker — two incidents, not one.
+
+### Watching it: metrics, and what to alarm on
+
+API Gateway emits these per API and per stage; there is no
+separate "throttled" metric — throttled requests appear as 4XX,
+so the alarm is on the 4XX rate, not on a count:
+
+| Metric | What it tells you | Alarm |
+|---|---|---|
+| `4XXError` | Client errors, including 429s | > 5% of requests for 5 min |
+| `5XXError` | Server errors | > 0 for 5 min (already alarmed, 26 Nov) |
+| `Count` | Total requests | A sudden 10x jump is a flood, even if nothing is throttled yet |
+| `Latency` / `IntegrationLatency` | Edge vs Lambda time | `Latency` climbing while `IntegrationLatency` is flat means API Gateway itself is the bottleneck |
+
+Add these to the 26 Nov dashboard as a fifth widget (4XX rate +
+request count), and one alarm: 4XX rate above 5% for 5 minutes,
+wired to the same SNS topic as the DLQ alarm. A throttling alarm
+is a customer-success signal, not a pager event — it usually means
+a real client outgrew their tier and needs to move from Free to
+Standard.
+
+### Cost, honestly
+
+Throttling and usage plans cost nothing — they are settings, not
+services. The bill is the requests themselves: API Gateway REST
+is ~$3.50 per million calls, so 10,000 registrations a month is
+about $0.04. The expensive mistake is the opposite one: no
+throttling, one abusive client, and a Lambda + SNS + DynamoDB bill
+for a million registrations nobody asked for. The limit is free;
+the flood is not.
+
+### Checklist before the next deploy
+
+- [ ] Stage throttle set on `prod` (rate + burst, documented above)
+- [ ] Three usage plans created (Free / Standard / Premium) with the throttle and quota from the table
+- [ ] API keys issued per client, each attached to one plan; `POST /register` requires a key
+- [ ] 429 returns the one error shape (`RATE_LIMITED` + `Retry-After`)
+- [ ] 4XX-rate alarm created, wired to the SNS topic, tested with a burst (101 calls in a minute on a Free key → the 101st gets 429)
+- [ ] Dashboard's fifth widget added (4XX rate + request count)
+
 ### What I will add next in this file
 
-- API Gateway throttling + usage plans, so one abusive client
-  cannot fill the queue faster than the workers drain it.
+- A load test that proves the throttle: burst the Free tier past its limit, confirm 429 + `Retry-After`, confirm no duplicate users (same `Idempotency-Key`) and no DLQ entries from the burst.
+- Then WAF in front of API Gateway, for the traffic throttling cannot judge (bad IPs, known bot patterns) — throttling limits volume, WAF judges intent.
